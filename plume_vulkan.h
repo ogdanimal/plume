@@ -256,11 +256,21 @@ namespace plume {
         uint32_t getTextureCount() const override;
         bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
         RenderWindow getWindow() const override;
+        void setRenderWindow(RenderWindow window) override;
         bool isEmpty() const override;
         uint32_t getRefreshRate() const override;
         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
         void releaseSwapChain();
         void releaseImageViews();
+#if defined(__ANDROID__)
+        // Rebuild the VkSurfaceKHR from a new ANativeWindow after the Android
+        // surface was destroyed/recreated on background/resume. Runs on the
+        // present thread (the swap chain's owner) from resize(). Returns false
+        // if the new window isn't ready yet.
+        bool recreateSurface();
+        // Set by setRenderWindow() from another thread; consumed by resize().
+        std::atomic<RenderWindow> pendingRenderWindow{nullptr};
+#endif
     };
 
     struct VulkanFramebuffer : RenderFramebuffer {

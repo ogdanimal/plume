@@ -99,6 +99,10 @@ namespace plume {
         virtual uint32_t getTextureCount() const = 0;
         virtual bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) = 0;
         virtual RenderWindow getWindow() const = 0;
+        // Hand the swap chain a new native window handle after the platform
+        // destroyed/recreated its surface (Android background/resume). Default
+        // is a no-op for platforms whose window handle never changes.
+        virtual void setRenderWindow(RenderWindow window) { }
         virtual bool isEmpty() const = 0;
 
         // Only valid if displayTiming is enabled in capabilities.

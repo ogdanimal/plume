@@ -1390,9 +1390,20 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.stage = stageInfo;
 
+        // Creation order index of this compute pipeline. Some drivers reject a
+        // shader only at pipeline-link time (e.g. the Adreno 6xx compute-linker
+        // bugs), so on failure we log the index and enough context to identify the
+        // offending shader; vk stays VK_NULL_HANDLE and setPipeline() refuses to
+        // bind it rather than letting the driver segfault. This is the diagnostic
+        // that makes the next weird-GPU port debuggable, so it stays in.
+        static int s_computePipelineIndex = 0;
+        const int pipelineIndex = s_computePipelineIndex++;
         VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+            fprintf(stderr, "vkCreateComputePipelines FAILED: compute pipeline index=%d VkResult=0x%X entry='%s' localSize=(%u,%u,%u). "
+                "The driver rejected this shader; it will not be bound. See plume_vulkan.cpp.\n",
+                pipelineIndex, res, computeShader->entryPointName.c_str(), desc.threadGroupSizeX, desc.threadGroupSizeY, desc.threadGroupSizeZ);
+            vk = VK_NULL_HANDLE;
             return;
         }
     }
@@ -1931,7 +1942,17 @@ namespace plume {
 
         VkResult res = vkAllocateDescriptorSets(device->vk, &allocateInfo, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkAllocateDescriptorSets failed with error code 0x%X.\n", res);
+            // Loud fail: on some drivers (e.g. Adreno's frozen blob) a VARIABLE_DESCRIPTOR_COUNT pool
+            // is sized by the binding's DECLARED count, not the requested variable count, so an
+            // undersized boundless pool returns VK_ERROR_OUT_OF_POOL_MEMORY. Log the shape so the
+            // next person porting to a weird GPU can see which set/type failed. vk stays null; the
+            // guards in setDescriptor / setDescriptorSet then refuse to touch the driver with it.
+            fprintf(stderr, "vkAllocateDescriptorSets failed with error code 0x%X (rangeCount=%u boundless=%d boundlessRangeSize=%u poolTypes=%zu).\n",
+                res, desc.descriptorRangesCount, (int)desc.lastRangeIsBoundless, boundlessRangeSize, typeCounts.size());
+            for (auto &tc : typeCounts) {
+                fprintf(stderr, "  descriptorType=%d count=%u\n", (int)tc.first, tc.second);
+            }
+            vk = VK_NULL_HANDLE;
             return;
         }
     }
@@ -2019,6 +2040,13 @@ namespace plume {
     }
 
     void VulkanDescriptorSet::setDescriptor(uint32_t descriptorIndex, const VkDescriptorBufferInfo *bufferInfo, const VkDescriptorImageInfo *imageInfo, const VkBufferView *texelBufferView, void *pNext) {
+        // If descriptor-set allocation failed at construction (e.g. VK_ERROR_OUT_OF_POOL_MEMORY on
+        // Adreno for UPDATE_AFTER_BIND pools), vk stays VK_NULL_HANDLE. Passing a null dstSet to
+        // vkUpdateDescriptorSets segfaults inside the Adreno driver, so refuse the write.
+        if (vk == VK_NULL_HANDLE) {
+            return;
+        }
+
         assert(descriptorIndex < setLayout->descriptorBindingIndices.size());
 
         const uint32_t indexBase = setLayout->descriptorIndexBases[descriptorIndex];
@@ -2204,6 +2232,13 @@ namespace plume {
             }
         }
 
+#if defined(__ANDROID__)
+        fprintf(stderr, "[plume] requested swapchain format=%d; %u surface formats offered:\n", (int)requestedFormat, surfaceFormatCount);
+        for (uint32_t i = 0; i < surfaceFormatCount; i++) {
+            fprintf(stderr, "[plume]   format=%d colorSpace=%d\n", (int)surfaceFormats[i].format, (int)surfaceFormats[i].colorSpace);
+        }
+#endif
+
         if (compatibleSurfaceFormats.empty()) {
             fprintf(stderr, "No compatible surface formats were found.\n");
             return;
@@ -2310,6 +2345,17 @@ namespace plume {
     }
 
     bool VulkanSwapChain::resize() {
+#   if defined(__ANDROID__)
+        // If the Android surface was destroyed and a new native window handed
+        // to us on resume, rebuild the VkSurfaceKHR before touching the swap
+        // chain. This runs on the present thread, the swap chain's owner.
+        if (pendingRenderWindow.load() != nullptr) {
+            if (!recreateSurface()) {
+                return false;
+            }
+        }
+#   endif
+
         getWindowSize(width, height);
 
         // Don't recreate the swap chain at all if the window doesn't have a valid size.
@@ -2435,6 +2481,95 @@ namespace plume {
     RenderWindow VulkanSwapChain::getWindow() const {
         return desc.renderWindow;
     }
+
+    void VulkanSwapChain::setRenderWindow(RenderWindow window) {
+#   if defined(__ANDROID__)
+        // Stashed for the present thread to consume in resize(); do not touch
+        // Vulkan objects here (this is called from the main/SDL thread).
+        pendingRenderWindow.store(window);
+#   else
+        (void)window;
+#   endif
+    }
+
+#   if defined(__ANDROID__)
+    // Rebuild the VkSurfaceKHR from a fresh ANativeWindow after Android destroyed
+    // and recreated the app surface across a background/resume. Runs on the present
+    // thread (the swap chain's owner) from resize().
+    //
+    // KNOWN BOUNDED WINDOW (intentionally not fully closed):
+    // Between SDL's onNativeSurfaceDestroyed returning to Android and the present
+    // thread parking (it stops getting work once the VI thread pauses on
+    // WILLENTERBACKGROUND), a present already in flight can still touch the old
+    // surface. Four facts make this safe-and-bounded rather than a defect:
+    //   1. Memory safety is SOURCE-VERIFIED, not merely spec-implied. On Android,
+    //      vkCreateAndroidSurfaceKHR lives in the platform libvulkan WSI
+    //      (AOSP frameworks/native/vulkan/libvulkan/swapchain.cpp), NOT the Adreno
+    //      vendor blob. The Surface struct holds the window as sp<ANativeWindow>,
+    //      taking a refcount at surface creation and dropping it at
+    //      vkDestroySurfaceKHR. SDL's own ANativeWindow_release at surfaceDestroyed
+    //      therefore cannot free the window out from under an in-flight present ->
+    //      no use-after-free, independent of the frozen driver.
+    //   2. The contract-violation itself (touching the surface after
+    //      surfaceDestroyed returns) degrades gracefully PLATFORM-WIDE: an abandoned
+    //      Android BufferQueue returns errors (NO_INIT / OUT_OF_DATE) from dequeue
+    //      rather than faulting -- not an Adreno-specific mercy.
+    //   3. The window is bounded by work starvation: the VI-thread pause stops
+    //      ScreenUpdateActions, so the present thread drains at most ~1-2 residual
+    //      frames then blocks on its cursor condition.
+    //   4. The rigorous fix (block surfaceDestroyed on a present-in-flight handshake)
+    //      is IMPOSSIBLE without forking SDL: surfaceDestroyed is handled entirely
+    //      inside SDL's Java+native shim; we never run synchronously at that callsite
+    //      (we only see the async SDL_APP_WILLENTERBACKGROUND later on our event
+    //      pump). SDL itself uses a bounded-spin (backup_done, 50x10ms) at that same
+    //      callsite for its EGL path -- the very idiom we'd be replicating.
+    bool VulkanSwapChain::recreateSurface() {
+        RenderWindow newWindow = pendingRenderWindow.exchange(nullptr);
+        if (newWindow == nullptr) {
+            return false;
+        }
+
+        VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+
+        // Tear down everything that referenced the old (destroyed) surface.
+        releaseImageViews();
+        releaseSwapChain();
+        if (surface != VK_NULL_HANDLE) {
+            vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
+            surface = VK_NULL_HANDLE;
+        }
+
+        // The old swap chain handle is meaningless once the surface is gone.
+        createInfo.oldSwapchain = VK_NULL_HANDLE;
+
+        VkAndroidSurfaceCreateInfoKHR surfaceCreateInfo = {};
+        surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+        surfaceCreateInfo.window = newWindow;
+        VkResult res = vkCreateAndroidSurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
+        if (res != VK_SUCCESS) {
+            // Leave desc.renderWindow pointing at the old (now-defunct) window
+            // rather than a window we failed to bind; needsResize() keeps
+            // returning true so resize() retries, and re-publishing a window
+            // sets pendingRenderWindow again for another attempt.
+            fprintf(stderr, "recreateSurface: vkCreateAndroidSurfaceKHR failed with error code 0x%X.\n", res);
+            surface = VK_NULL_HANDLE;
+            return false;
+        }
+
+        // Only commit the new window once its surface actually bound.
+        desc.renderWindow = newWindow;
+
+        VkBool32 presentSupported = false;
+        vkGetPhysicalDeviceSurfaceSupportKHR(commandQueue->device->physicalDevice, commandQueue->familyIndex, surface, &presentSupported);
+        if (!presentSupported) {
+            fprintf(stderr, "recreateSurface: recreated surface does not support present.\n");
+            return false;
+        }
+
+        fprintf(stderr, "[plume] surface recreated from new ANativeWindow %p\n", (void *)newWindow);
+        return true;
+    }
+#   endif
 
     bool VulkanSwapChain::isEmpty() const {
         return (vk == VK_NULL_HANDLE) || (width == 0) || (height == 0);
@@ -2940,6 +3075,16 @@ namespace plume {
         switch (interfacePipeline->type) {
         case VulkanPipeline::Type::Compute: {
             const VulkanComputePipeline *computePipeline = static_cast<const VulkanComputePipeline *>(interfacePipeline);
+            // A compute pipeline whose vkCreateComputePipelines call failed (see
+            // VulkanComputePipeline's ctor) leaves vk == VK_NULL_HANDLE. Binding a
+            // null pipeline dereferences a null handle inside the driver and
+            // segfaults. Refuse the bind and log instead of crashing, so a driver
+            // that rejects a shader (e.g. the Adreno 6xx compute-linker bugs) fails
+            // loudly at the bind rather than mysteriously in the driver.
+            if (computePipeline->vk == VK_NULL_HANDLE) {
+                fprintf(stderr, "setPipeline: refusing to bind a compute pipeline that failed to create (vk == VK_NULL_HANDLE).\n");
+                return;
+            }
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline->vk);
             break;
         }
@@ -3488,6 +3633,12 @@ namespace plume {
         assert(setIndex < pipelineLayout->descriptorSetLayouts.size());
 
         const VulkanDescriptorSet *interfaceSet = static_cast<const VulkanDescriptorSet *>(descriptorSet);
+        if (interfaceSet->vk == VK_NULL_HANDLE) {
+            // A descriptor set whose allocation failed (null handle) must never be bound: the Adreno
+            // driver dereferences the handle and segfaults. Skip the bind rather than crash.
+            fprintf(stderr, "[plume] refusing to bind null descriptor set (setIndex=%u)\n", setIndex);
+            return;
+        }
         vkCmdBindDescriptorSets(vk, bindPoint, pipelineLayout->vk, setIndex, 1, &interfaceSet->vk, 0, nullptr);
     }
 
@@ -3894,6 +4045,15 @@ namespace plume {
         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         deviceFeatures.pNext = featuresChain;
         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
+
+#if defined(__ANDROID__)
+        fprintf(stderr, "[plume] storageImageReadWithoutFormat=%d writeWithoutFormat=%d shaderInt64=%d fragmentStoresAndAtomics=%d vertexPipelineStoresAndAtomics=%d\n",
+            (int)deviceFeatures.features.shaderStorageImageReadWithoutFormat,
+            (int)deviceFeatures.features.shaderStorageImageWriteWithoutFormat,
+            (int)deviceFeatures.features.shaderInt64,
+            (int)deviceFeatures.features.fragmentStoresAndAtomics,
+            (int)deviceFeatures.features.vertexPipelineStoresAndAtomics);
+#endif
 
         // Check for properties.
         if (rayTracingFound) {
