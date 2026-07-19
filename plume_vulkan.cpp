@@ -3936,6 +3936,19 @@ namespace plume {
             return;
         }
 
+        // Identify the device that was actually chosen. Bug reports that include
+        // this line are usually diagnosable on sight.
+        {
+            VkPhysicalDeviceProperties chosenProperties;
+            vkGetPhysicalDeviceProperties(physicalDevice, &chosenProperties);
+            fprintf(stderr, "[plume] Using device \"%s\" (vendor 0x%04X, device API %u.%u.%u, driver 0x%08X).\n",
+                chosenProperties.deviceName, chosenProperties.vendorID,
+                VK_API_VERSION_MAJOR(chosenProperties.apiVersion),
+                VK_API_VERSION_MINOR(chosenProperties.apiVersion),
+                VK_API_VERSION_PATCH(chosenProperties.apiVersion),
+                chosenProperties.driverVersion);
+        }
+
         // Check for extensions.
         uint32_t extensionCount;
         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr);
@@ -4623,6 +4636,18 @@ namespace plume {
             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
             return;
         }
+
+        // vkEnumerateInstanceVersion is a 1.1 entry point; a null pointer means a
+        // 1.0 loader. Reported up front because it is the single fact that
+        // explains most "it just closes on launch" reports.
+        uint32_t loaderApiVersion = VK_API_VERSION_1_0;
+        if (vkEnumerateInstanceVersion != nullptr) {
+            vkEnumerateInstanceVersion(&loaderApiVersion);
+        }
+
+        fprintf(stderr, "[plume] Vulkan loader supports %u.%u.%u, requesting %u.%u.\n",
+            VK_API_VERSION_MAJOR(loaderApiVersion), VK_API_VERSION_MINOR(loaderApiVersion), VK_API_VERSION_PATCH(loaderApiVersion),
+            VK_API_VERSION_MAJOR(VK_API_VERSION_1_2), VK_API_VERSION_MINOR(VK_API_VERSION_1_2));
 
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "plume";
