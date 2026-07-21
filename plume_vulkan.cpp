@@ -2108,6 +2108,21 @@ namespace plume {
         this->commandQueue = commandQueue;
         this->desc = desc;
 
+#   if defined(__ANDROID__)
+        // OWNERSHIP INVARIANT (Android resume-window lifetime): every non-null
+        // ANativeWindow held in one of our slots -- desc.renderWindow here,
+        // pendingRenderWindow, and the host's g_pending_resume_window -- carries
+        // exactly one ref that WE own. The window passed in desc is SDL's,
+        // unacquired, so take our own ref now; recreateSurface() releases it when
+        // it adopts a resume window, and the destructor releases whatever remains.
+        // This makes the construction window owned uniformly (no first-window
+        // special case) so recreateSurface can always release the window it
+        // replaces. See the block comment on recreateSurface().
+        if (this->desc.renderWindow != nullptr) {
+            ANativeWindow_acquire(this->desc.renderWindow);
+        }
+#   endif
+
         VkResult res;
 
 #   ifdef _WIN64
@@ -2283,6 +2298,19 @@ namespace plume {
             VulkanInterface *renderInterface = commandQueue->device->renderInterface;
             vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
         }
+
+#   if defined(__ANDROID__)
+        // Release the refs we own on the adopted window and any resume window
+        // that was published but never consumed (see the ownership invariant in
+        // the constructor).
+        if (desc.renderWindow != nullptr) {
+            ANativeWindow_release(desc.renderWindow);
+            desc.renderWindow = nullptr;
+        }
+        if (RenderWindow pending = pendingRenderWindow.exchange(nullptr)) {
+            ANativeWindow_release(pending);
+        }
+#   endif
 
         // Remove tracking from the parent command queue.
         commandQueue->swapChains.erase(this);
@@ -2484,9 +2512,19 @@ namespace plume {
 
     void VulkanSwapChain::setRenderWindow(RenderWindow window) {
 #   if defined(__ANDROID__)
-        // Stashed for the present thread to consume in resize(); do not touch
-        // Vulkan objects here (this is called from the main/SDL thread).
-        pendingRenderWindow.store(window);
+        // `window` arrives with a ref the host already owns on our behalf (the
+        // host acquired it at publish); storing it transfers that ref into the
+        // pendingRenderWindow slot. If a prior resume window is still queued here
+        // (the present thread hasn't consumed it yet), release our ref on it --
+        // it is being superseded and will never be adopted. Stashed for the
+        // present thread to consume in resize(); do not touch Vulkan objects here
+        // (this is called from the gfx thread).
+        // Always release the displaced ref, even if prev == window: prev and
+        // window each carried their own owned ref, and only one slot remains.
+        // The just-stored ref keeps the window alive.
+        if (RenderWindow prev = pendingRenderWindow.exchange(window)) {
+            ANativeWindow_release(prev);
+        }
 #   else
         (void)window;
 #   endif
@@ -2531,6 +2569,23 @@ namespace plume {
 
         VulkanInterface *renderInterface = commandQueue->device->renderInterface;
 
+        // Adopt the new window NOW, before tearing down the old surface (P1 fix).
+        // vkDestroySurfaceKHR below drops libvulkan's ref on the OLD window, and
+        // SDL has already dropped its own (~500ms after surfaceDestroyed), so the
+        // old window can be freed the instant its surface dies. If a subsequent
+        // vkCreateAndroidSurfaceKHR failed while desc.renderWindow still pointed
+        // at that freed window, needsResize()/getWindowSize() would deref it at
+        // frame rate. Pointing desc.renderWindow at newWindow -- which we own a
+        // ref on (transferred from the pendingRenderWindow slot) -- keeps every
+        // deref safe whether or not the bind below succeeds. The replaced
+        // window's ref is released unconditionally: newWindow's ref, now living
+        // in desc.renderWindow, keeps it alive even if old == newWindow. Net ref
+        // move, no leak. (See the ownership invariant in the constructor.)
+        if (desc.renderWindow != nullptr) {
+            ANativeWindow_release(desc.renderWindow);
+        }
+        desc.renderWindow = newWindow;
+
         // Tear down everything that referenced the old (destroyed) surface.
         releaseImageViews();
         releaseSwapChain();
@@ -2547,17 +2602,14 @@ namespace plume {
         surfaceCreateInfo.window = newWindow;
         VkResult res = vkCreateAndroidSurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
         if (res != VK_SUCCESS) {
-            // Leave desc.renderWindow pointing at the old (now-defunct) window
-            // rather than a window we failed to bind; needsResize() keeps
-            // returning true so resize() retries, and re-publishing a window
-            // sets pendingRenderWindow again for another attempt.
+            // desc.renderWindow already points at newWindow (a window we own a ref
+            // on), so this failure path is deref-safe; needsResize() keeps
+            // returning true so resize() retries, and re-publishing a window sets
+            // pendingRenderWindow again for another attempt.
             fprintf(stderr, "recreateSurface: vkCreateAndroidSurfaceKHR failed with error code 0x%X.\n", res);
             surface = VK_NULL_HANDLE;
             return false;
         }
-
-        // Only commit the new window once its surface actually bound.
-        desc.renderWindow = newWindow;
 
         VkBool32 presentSupported = false;
         vkGetPhysicalDeviceSurfaceSupportKHR(commandQueue->device->physicalDevice, commandQueue->familyIndex, surface, &presentSupported);
