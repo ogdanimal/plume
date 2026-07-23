@@ -4112,12 +4112,13 @@ namespace plume {
         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
 
 #if defined(__ANDROID__)
-        fprintf(stderr, "[plume] storageImageReadWithoutFormat=%d writeWithoutFormat=%d shaderInt64=%d fragmentStoresAndAtomics=%d vertexPipelineStoresAndAtomics=%d\n",
+        fprintf(stderr, "[plume] storageImageReadWithoutFormat=%d writeWithoutFormat=%d shaderInt64=%d fragmentStoresAndAtomics=%d vertexPipelineStoresAndAtomics=%d dualSrcBlend=%d\n",
             (int)deviceFeatures.features.shaderStorageImageReadWithoutFormat,
             (int)deviceFeatures.features.shaderStorageImageWriteWithoutFormat,
             (int)deviceFeatures.features.shaderInt64,
             (int)deviceFeatures.features.fragmentStoresAndAtomics,
-            (int)deviceFeatures.features.vertexPipelineStoresAndAtomics);
+            (int)deviceFeatures.features.vertexPipelineStoresAndAtomics,
+            (int)deviceFeatures.features.dualSrcBlend);
 #endif
 
         // Check for properties.
@@ -4353,6 +4354,7 @@ namespace plume {
         capabilities.displayTiming = supportedOptionalExtensions.find(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) != supportedOptionalExtensions.end();
         capabilities.maxTextureSize = physicalDeviceProperties.limits.maxImageDimension2D;
         capabilities.preferHDR = memoryHeapSize > (512 * 1024 * 1024);
+        capabilities.dualSrcBlend = deviceFeatures.features.dualSrcBlend;
         capabilities.dynamicDepthBias = true;
         capabilities.queryPools = true;
         capabilities.uma = (description.type == RenderDeviceType::INTEGRATED) && hasHostVisibleDeviceLocalMemory;

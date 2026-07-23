@@ -1800,6 +1800,10 @@ namespace plume {
         bool triangleFan = false;
         bool dynamicDepthBias = false;
 
+        // Blending. Mali (ARM) GPUs do not expose dual source blending, so anything
+        // that relies on a secondary blend output needs a single source fallback.
+        bool dualSrcBlend = false;
+
         // UMA.
         bool uma = false;
 

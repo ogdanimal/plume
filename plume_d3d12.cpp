@@ -3861,6 +3861,7 @@ namespace plume {
         capabilities.queryPools = true;
         capabilities.maxTextureSize = 16384;
         capabilities.preferHDR = description.dedicatedVideoMemory > (512 * 1024 * 1024);
+        capabilities.dualSrcBlend = true;
         capabilities.samplerMirrorClampToEdge = true;
 
         // Create descriptor heaps allocator.
