@@ -4158,6 +4158,20 @@ namespace plume {
             createDeviceChain = &indexingFeatures;
         }
 
+#if defined(__ANDROID__)
+        // Logged here rather than with the other feature bits above because this is the exact
+        // expression that becomes capabilities.descriptorIndexing, so the two cannot drift.
+        // The sub-features are printed individually to distinguish "extension absent" (all zero)
+        // from "extension present but one sub-feature missing".
+        fprintf(stderr, "[plume] descriptorIndexingExt=%d partiallyBound=%d variableDescriptorCount=%d runtimeDescriptorArray=%d sampledImageArrayNonUniformIndexing=%d descriptorIndexing=%d\n",
+            (int)descriptorIndexingFound,
+            (int)indexingFeatures.descriptorBindingPartiallyBound,
+            (int)indexingFeatures.descriptorBindingVariableDescriptorCount,
+            (int)indexingFeatures.runtimeDescriptorArray,
+            (int)indexingFeatures.shaderSampledImageArrayNonUniformIndexing,
+            (int)descriptorIndexingSupported);
+#endif
+
         const bool scalarBlockLayoutSupported = layoutFeatures.scalarBlockLayout;
         if (scalarBlockLayoutSupported) {
             layoutFeatures.pNext = createDeviceChain;
