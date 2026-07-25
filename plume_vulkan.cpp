@@ -4694,12 +4694,30 @@ namespace plume {
 
     // VulkanInterface
 
+#if defined(PLUME_CUSTOM_VULKAN_LOADER)
+    // Set by the host before the interface is constructed when it has loaded a
+    // Vulkan implementation itself rather than letting volk dlopen the system
+    // one. Null means "behave exactly as an unmodified build", which is why the
+    // whole mechanism is behind a define: nothing changes unless someone opts in.
+    static PFN_vkGetInstanceProcAddr customVulkanLoader = nullptr;
+
+    void SetCustomVulkanLoader(PFN_vkGetInstanceProcAddr getInstanceProcAddr) {
+        customVulkanLoader = getInstanceProcAddr;
+    }
+#endif
+
 #if PLUME_SDL_VULKAN_ENABLED
     VulkanInterface::VulkanInterface(RenderWindow sdlWindow) {
 #else
     VulkanInterface::VulkanInterface() {
 #endif
+#   if defined(PLUME_CUSTOM_VULKAN_LOADER)
+        VkResult res = (customVulkanLoader != nullptr)
+            ? (volkInitializeCustom(customVulkanLoader), VK_SUCCESS)
+            : volkInitialize();
+#   else
         VkResult res = volkInitialize();
+#   endif
         if (res != VK_SUCCESS) {
             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
             return;

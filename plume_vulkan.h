@@ -458,6 +458,14 @@ namespace plume {
         bool endCapture() override;
     };
 
+#if defined(PLUME_CUSTOM_VULKAN_LOADER)
+    // Installs a vkGetInstanceProcAddr obtained from somewhere other than volk's
+    // own dlopen of the system Vulkan loader. Must be called before constructing
+    // VulkanInterface; passing null (the default) leaves initialisation exactly
+    // as it is in a build without this define.
+    void SetCustomVulkanLoader(PFN_vkGetInstanceProcAddr getInstanceProcAddr);
+#endif
+
     struct VulkanInterface : RenderInterface {
         VkInstance instance = VK_NULL_HANDLE;
         VkApplicationInfo appInfo = {};
